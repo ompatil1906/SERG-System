@@ -9,8 +9,18 @@ const { dispatchAmbulance } = require('../services/ambulanceDispatcher');
 
 // Mock user contacts for demonstration
 const EMERGENCY_CONTACTS = [
-    { name: 'Admin', phone: '+1234567890', email: 'admin@example.com' } // Change effectively via dashboard
+    { name: 'Admin', phone: '+1234567890', email: 'admin@example.com' }
 ];
+
+// --- In-memory device cache (bypasses Firestore quota limits) ---
+// Gets updated every time an ESP32 payload arrives
+const deviceCache = {};
+
+// --- Public live-data endpoint — frontend polls this every 2s ---
+router.get('/live-data', (req, res) => {
+    const devices = Object.values(deviceCache);
+    res.json({ devices, updatedAt: new Date().toISOString() });
+});
 
 // --- Authentication Route ---
 router.post('/auth/login', (req, res) => {
@@ -37,6 +47,7 @@ function verifyToken(req, res, next) {
 
 // --- Data Ingestion Endpoint (from ESP32) ---
 router.post('/device-data', async (req, res) => {
+    console.log(`[${new Date().toISOString()}] ✅ Request received from ${req.ip}`);
     try {
         const data = req.body;
 
@@ -45,59 +56,76 @@ router.post('/device-data', async (req, res) => {
             return res.status(400).json({ error: 'Missing critical fields' });
         }
 
-        // 1. Run Accident Detection Logic
+        // 1. Run Accident Detection Logic (fast, sync)
         const analysis = analyzeTelemetry(data);
 
-        // 2. Prepare Firestore DB operations
-        const deviceRef = db.collection('devices').doc(data.device_id);
-        const historyRef = deviceRef.collection('history').doc();
-        const batch = db.batch();
-
-        // Set History
-        batch.set(historyRef, {
-            ...data,
-            server_timestamp: new Date().toISOString(),
-            is_accident: analysis.isAccident,
-            severity: analysis.severity
-        });
-
-        // Update Latest Data
-        batch.set(deviceRef, {
+        // 2. Update in-memory cache immediately (works even if Firestore quota is exhausted)
+        deviceCache[data.device_id] = {
+            id: data.device_id,
+            status: 'Online',
+            last_seen: new Date().toISOString(),
             latest_data: {
                 ...data,
                 server_timestamp: new Date().toISOString(),
                 is_accident: analysis.isAccident,
                 severity: analysis.severity
-            },
-            status: 'Online',
-            last_seen: new Date().toISOString()
-        }, { merge: true });
+            }
+        };
 
-        // Handle Alerts if Accident Detected
-        let alertRef = null;
-        if (analysis.isAccident) {
-            alertRef = db.collection('alerts').doc();
-            batch.set(alertRef, {
-                device_id: data.device_id,
-                location: { lat: data.latitude, lng: data.longitude },
-                severity: analysis.severity,
-                triggers: analysis.triggers,
-                status: 'Unresolved', // Actionable: Unresolved, In-Progress, Resolved
-                timestamp: analysis.timestamp
-            });
-        }
+        // 3. ACK the ESP32 IMMEDIATELY — don't wait for Firebase
+        res.status(201).json({ success: true, is_accident: analysis.isAccident });
 
-        await batch.commit();
+        // 3. All Firebase writes + notifications happen in background AFTER response
+        setImmediate(async () => {
+            try {
+                const deviceRef = db.collection('devices').doc(data.device_id);
+                const historyRef = deviceRef.collection('history').doc();
+                const batch = db.batch();
 
-        // 3. Trigger External Notifications + Ambulance Dispatch Async (Non-blocking)
-        if (analysis.isAccident) {
-            triggerEmergencyNotifications(data, analysis, EMERGENCY_CONTACTS)
-                .catch(err => console.error('Notification Error:', err));
-            dispatchAmbulance(data)
-                .catch(err => console.error('Ambulance Dispatch Error:', err));
-        }
+                batch.set(historyRef, {
+                    ...data,
+                    server_timestamp: new Date().toISOString(),
+                    is_accident: analysis.isAccident,
+                    severity: analysis.severity
+                });
 
-        return res.status(201).json({ success: true, is_accident: analysis.isAccident });
+                batch.set(deviceRef, {
+                    latest_data: {
+                        ...data,
+                        server_timestamp: new Date().toISOString(),
+                        is_accident: analysis.isAccident,
+                        severity: analysis.severity
+                    },
+                    status: 'Online',
+                    last_seen: new Date().toISOString()
+                }, { merge: true });
+
+                if (analysis.isAccident) {
+                    const alertRef = db.collection('alerts').doc();
+                    batch.set(alertRef, {
+                        device_id: data.device_id,
+                        location: { lat: data.latitude, lng: data.longitude },
+                        severity: analysis.severity,
+                        triggers: analysis.triggers,
+                        status: 'Unresolved',
+                        timestamp: analysis.timestamp
+                    });
+                }
+
+                await batch.commit();
+                console.log(`[DB] Data saved for ${data.device_id} | accident=${analysis.isAccident}`);
+
+                if (analysis.isAccident) {
+                    triggerEmergencyNotifications(data, analysis, EMERGENCY_CONTACTS)
+                        .catch(err => console.error('Notification Error:', err));
+                    dispatchAmbulance(data)
+                        .catch(err => console.error('Ambulance Dispatch Error:', err));
+                }
+            } catch (bgErr) {
+                console.error('[BG] Firebase write error:', bgErr.message);
+            }
+        });
+
     } catch (error) {
         console.error('Data ingestion error:', error);
         return res.status(500).json({ error: 'Internal Server Error' });

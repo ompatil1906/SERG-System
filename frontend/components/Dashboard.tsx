@@ -4,15 +4,30 @@ import { useEffect, useState } from 'react';
 import { db } from '@/lib/firebase';
 import { collection, onSnapshot, query, orderBy, limit, writeBatch, getDocs, doc } from 'firebase/firestore';
 import Map from '@/components/Map';
-import { AlertTriangle, Activity, MapPin, Clock } from 'lucide-react';
+import { AlertTriangle, Activity, MapPin, Clock, Zap, Gauge } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 
 export default function Dashboard() {
     const [devices, setDevices] = useState<any[]>([]);
+    const [liveDevices, setLiveDevices] = useState<any[]>([]); // Polled from backend (no Firestore quota)
     const [alerts, setAlerts] = useState<any[]>([]);
     const [ambulances, setAmbulances] = useState<any[]>([]);
     const [signals, setSignals] = useState<any[]>([]);
     const [center] = useState({ lat: 18.5204, lng: 73.8567 });
+
+    // Poll backend /api/live-data every 2s (bypasses Firestore quota limits)
+    useEffect(() => {
+        const fetchLive = async () => {
+            try {
+                const res = await fetch('http://10.125.252.77:5000/api/live-data');
+                const json = await res.json();
+                if (json.devices?.length > 0) setLiveDevices(json.devices);
+            } catch (_) { /* backend not reachable, keep showing last known state */ }
+        };
+        fetchLive();
+        const interval = setInterval(fetchLive, 2000);
+        return () => clearInterval(interval);
+    }, []);
 
     useEffect(() => {
         const unsubDevices = onSnapshot(collection(db, 'devices'), (snapshot) => {
@@ -90,6 +105,68 @@ export default function Dashboard() {
                             </div>
                         ))}
                     </div>
+                </div>
+
+                {/* Live Telemetry — ESP32 Sensor Data */}
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 overflow-auto">
+                    <h2 className="text-lg font-bold mb-3 flex items-center gap-2 text-cyan-400">
+                        <Zap className="w-4 h-4 animate-pulse" /> Live Telemetry
+                    </h2>
+                    {liveDevices.length === 0 ? (
+                        <p className="text-slate-500 italic text-sm">Waiting for ESP32 data… (is backend running?)</p>
+                    ) : liveDevices.map(device => {
+                        const d = device.latest_data;
+                        if (!d) return (
+                            <div key={device.id} className="text-slate-500 text-sm italic">
+                                {device.id} — awaiting first payload…
+                            </div>
+                        );
+                        const accel = parseFloat(d.acceleration || 0);
+                        const tilt = parseFloat(d.tilt_angle || 0);
+                        const accelPct = Math.min((accel / 6) * 100, 100);
+                        const accelColor = accel > 3 ? 'bg-red-500' : accel > 1.5 ? 'bg-yellow-400' : 'bg-emerald-400';
+                        const accelText = accel > 3 ? 'text-red-400' : accel > 1.5 ? 'text-yellow-400' : 'text-emerald-400';
+                        return (
+                            <div key={device.id} className="mb-3 last:mb-0">
+                                <div className="flex justify-between items-center mb-2">
+                                    <span className="font-mono text-sm text-slate-200">{device.id}</span>
+                                    <span className={`px-2 py-0.5 rounded text-xs font-bold ${d.is_accident ? 'bg-red-500/20 text-red-400 animate-pulse' : 'bg-emerald-500/10 text-emerald-500'}`}>
+                                        {d.is_accident ? '🚨 ACCIDENT' : '✅ NORMAL'}
+                                    </span>
+                                </div>
+                                {/* Acceleration Bar */}
+                                <div className="mb-2">
+                                    <div className="flex justify-between text-xs mb-1">
+                                        <span className="text-slate-400 flex items-center gap-1"><Gauge className="w-3 h-3" /> Acceleration</span>
+                                        <span className={`font-mono font-bold ${accelText}`}>{accel.toFixed(2)}g</span>
+                                    </div>
+                                    <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                                        <div className={`h-full rounded-full transition-all duration-500 ${accelColor}`}
+                                            style={{ width: `${accelPct}%` }} />
+                                    </div>
+                                </div>
+                                {/* Stats Row */}
+                                <div className="grid grid-cols-3 gap-2 text-xs">
+                                    <div className="bg-slate-800 rounded p-2 text-center">
+                                        <div className="text-slate-400">Tilt</div>
+                                        <div className="text-slate-200 font-mono font-bold">{tilt.toFixed(1)}°</div>
+                                    </div>
+                                    {d.gps_fix && (
+                                        <div className="bg-slate-800 rounded p-2 text-center">
+                                            <div className="text-slate-400">GPS</div>
+                                            <div className="font-bold text-emerald-400">🛰 Fixed</div>
+                                        </div>
+                                    )}
+                                    <div className="bg-slate-800 rounded p-2 text-center">
+                                        <div className="text-slate-400">Seen</div>
+                                        <div className="text-slate-200 font-mono" style={{ fontSize: '10px' }}>
+                                            {formatDistanceToNow(new Date(d.server_timestamp || Date.now()), { addSuffix: true })}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })}
                 </div>
 
                 {/* Ambulance Status */}

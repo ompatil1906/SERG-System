@@ -84,18 +84,26 @@ export default function MapComponent({ center, devices, ambulances, signals }: M
                     url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                 />
 
-                {/* --- Device Markers (hide vehicle_001) --- */}
+                {/* --- Device Markers --- */}
                 {devices.filter(d => d.id !== 'vehicle_001').map((device) => {
                     const lat = device.latest_data?.latitude || device.latitude;
                     const lng = device.latest_data?.longitude || device.longitude;
                     if (!lat || !lng) return null;
+                    // Only show on map if GPS fix is real (hide default/fallback location)
+                    if (!device.latest_data?.gps_fix) return null;
                     const isAccident = device.latest_data?.is_accident || device.is_accident;
+                    const d = device.latest_data;
                     return (
                         <Marker key={device.id} position={[parseFloat(lat), parseFloat(lng)]} icon={isAccident ? accidentIcon : normalIcon}>
                             <Popup>
-                                <div className="text-slate-900">
-                                    <p className="font-bold">{device.id}</p>
-                                    <p>Status: {isAccident ? '🚨 Accident Detected' : '✅ Normal'}</p>
+                                <div className="text-slate-900 min-w-[180px]">
+                                    <p className="font-bold text-base">{device.id}</p>
+                                    <p className="mt-1">{isAccident ? '🚨 Accident Detected' : '✅ Normal'}</p>
+                                    {d && <>
+                                        <p className="text-sm mt-1">⚡ Accel: <strong>{parseFloat(d.acceleration || 0).toFixed(2)}g</strong></p>
+                                        <p className="text-sm">📐 Tilt: <strong>{parseFloat(d.tilt_angle || 0).toFixed(1)}°</strong></p>
+                                        <p className="text-sm">🛰 GPS: <strong>{d.gps_fix ? 'Fixed' : 'Default location'}</strong></p>
+                                    </>}
                                 </div>
                             </Popup>
                         </Marker>
