@@ -1,0 +1,46 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Devices Collection
+    match /devices/{deviceId} {
+      allow read: if true;
+      allow update: if true;   // Dashboard reset can clear device location/status
+      allow create, delete: if false; // Only backend (Admin SDK) can create devices
+
+      // History Subcollection
+      match /history/{historyId} {
+        allow read: if true;
+        allow write: if false;
+      }
+    }
+    
+    // Alerts Collection
+    match /alerts/{alertId} {
+      allow read: if true;
+      allow delete: if true;  // Dashboard can clear resolved alerts
+      allow create, update: if false; // Only backend (Admin SDK) can create alerts
+    }
+    
+    // Ambulances Collection
+    match /ambulances/{ambId} {
+      allow read: if true;
+      allow delete: if true;   // Dashboard reset clears ambulances
+      allow create, update: if false; // Only backend (Admin SDK) manages ambulances
+    }
+
+    // Traffic Signals Collection
+    match /traffic_signals/{signalId} {
+      allow read: if true;
+      allow update: if true;   // Dashboard reset reverts signals to red
+      allow create, delete: if false; // Only backend manages signal lifecycle
+    }
+
+    // Users Collection (if needed for dashboard auth later)
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
+    }
+  }
+}

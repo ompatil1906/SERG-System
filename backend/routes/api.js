@@ -1,0 +1,136 @@
+const express = require('express');
+const router = express.Router();
+const jwt = require('jsonwebtoken');
+
+const { db } = require('../services/firebase');
+const { analyzeTelemetry } = require('../services/accidentDetection');
+const { triggerEmergencyNotifications } = require('../services/notifier');
+const { dispatchAmbulance } = require('../services/ambulanceDispatcher');
+
+// Mock user contacts for demonstration
+const EMERGENCY_CONTACTS = [
+    { name: 'Admin', phone: '+1234567890', email: 'admin@example.com' } // Change effectively via dashboard
+];
+
+// --- Authentication Route ---
+router.post('/auth/login', (req, res) => {
+    const { username, password } = req.body;
+    // Basic hardcoded check for demo purposes
+    if (username === 'admin' && password === 'admin123') {
+        const token = jwt.sign({ username, role: 'admin' }, process.env.JWT_SECRET || 'fallback_secret', { expiresIn: '2h' });
+        return res.json({ token });
+    }
+    return res.status(401).json({ error: 'Invalid credentials' });
+});
+
+// --- Middleware to verify JWT ---
+function verifyToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) return res.status(403).json({ error: 'No token provided' });
+    const token = authHeader.split(' ')[1];
+    jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret', (err, decoded) => {
+        if (err) return res.status(401).json({ error: 'Unauthorized' });
+        req.user = decoded;
+        next();
+    });
+}
+
+// --- Data Ingestion Endpoint (from ESP32) ---
+router.post('/device-data', async (req, res) => {
+    try {
+        const data = req.body;
+
+        // Basic Validation
+        if (!data.device_id || !data.latitude || !data.longitude) {
+            return res.status(400).json({ error: 'Missing critical fields' });
+        }
+
+        // 1. Run Accident Detection Logic
+        const analysis = analyzeTelemetry(data);
+
+        // 2. Prepare Firestore DB operations
+        const deviceRef = db.collection('devices').doc(data.device_id);
+        const historyRef = deviceRef.collection('history').doc();
+        const batch = db.batch();
+
+        // Set History
+        batch.set(historyRef, {
+            ...data,
+            server_timestamp: new Date().toISOString(),
+            is_accident: analysis.isAccident,
+            severity: analysis.severity
+        });
+
+        // Update Latest Data
+        batch.set(deviceRef, {
+            latest_data: {
+                ...data,
+                server_timestamp: new Date().toISOString(),
+                is_accident: analysis.isAccident,
+                severity: analysis.severity
+            },
+            status: 'Online',
+            last_seen: new Date().toISOString()
+        }, { merge: true });
+
+        // Handle Alerts if Accident Detected
+        let alertRef = null;
+        if (analysis.isAccident) {
+            alertRef = db.collection('alerts').doc();
+            batch.set(alertRef, {
+                device_id: data.device_id,
+                location: { lat: data.latitude, lng: data.longitude },
+                severity: analysis.severity,
+                triggers: analysis.triggers,
+                status: 'Unresolved', // Actionable: Unresolved, In-Progress, Resolved
+                timestamp: analysis.timestamp
+            });
+        }
+
+        await batch.commit();
+
+        // 3. Trigger External Notifications + Ambulance Dispatch Async (Non-blocking)
+        if (analysis.isAccident) {
+            triggerEmergencyNotifications(data, analysis, EMERGENCY_CONTACTS)
+                .catch(err => console.error('Notification Error:', err));
+            dispatchAmbulance(data)
+                .catch(err => console.error('Ambulance Dispatch Error:', err));
+        }
+
+        return res.status(201).json({ success: true, is_accident: analysis.isAccident });
+    } catch (error) {
+        console.error('Data ingestion error:', error);
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// --- Dashboard Endpoints ---
+// Get live devices
+router.get('/live-devices', verifyToken, async (req, res) => {
+    try {
+        const snapshot = await db.collection('devices').get();
+        const devices = [];
+        snapshot.forEach(doc => {
+            devices.push({ id: doc.id, ...doc.data() });
+        });
+        return res.json({ devices });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to fetch devices' });
+    }
+});
+
+// Get recent alerts
+router.get('/alerts', verifyToken, async (req, res) => {
+    try {
+        const snapshot = await db.collection('alerts').orderBy('timestamp', 'desc').limit(50).get();
+        const alerts = [];
+        snapshot.forEach(doc => {
+            alerts.push({ id: doc.id, ...doc.data() });
+        });
+        return res.json({ alerts });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to fetch alerts' });
+    }
+});
+
+module.exports = router;
