@@ -36,7 +36,7 @@ try {
 let db;
 if (admin.apps.length > 0) {
     db = admin.firestore();
-    db.settings({ preferRest: true }); // Bypass Node.js IPv6 gRPC DEADLINE_EXCEEDED bugs
+    db.settings({ preferRest: true, ignoreUndefinedProperties: true }); // Bypass Node.js IPv6 gRPC DEADLINE_EXCEEDED bugs and handle undefined fields
 } else {
     console.warn("Firebase not initialized! Using mock DB operations.");
     db = {

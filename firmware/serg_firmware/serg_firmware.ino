@@ -25,16 +25,17 @@ const char *password = "12344321"; // Your Wi-Fi password
 // !! UPDATE THIS IP if you get Error -11 (Connection Refused) !!
 const char *serverName = "http://10.125.252.77:5000/api/device-data";
 
-// Default GPS location — AISSMS Institute of Information Technology, Pune
-const float DEFAULT_LAT = 18.5158;
-const float DEFAULT_LNG = 73.8463;
+// Default GPS location — AISSMS Institute of Information Technology, Pune (Near
+// Raja Bahadur Mill Road)
+const float DEFAULT_LAT = 18.5315;
+const float DEFAULT_LNG = 73.8670;
 
 // Device ID — must be unique per vehicle
 const String deviceID = "vehicle_esp32_001";
 
 // --- Hardware Pins ---
 const int BUTTON_PIN = 18;
-const int BUZZER_PIN = 19;
+const int BUZZER_PIN = 25;
 const int LED_PIN = 5;
 
 // --- Modules ---
@@ -44,9 +45,13 @@ HardwareSerial SerialGPS(1); // Using UART1 for GPS: RX=16, TX=17
 
 // --- Timing ---
 unsigned long lastTime = 0;
-unsigned long timerDelay = 1000; // Send payload every 1 second
+unsigned long buzzerStartTime = 0;
+unsigned long timerDelay = 1000;            // Send payload every 1 second
+const unsigned long BUZZER_DURATION = 4000; // 4 seconds
 
 // --- Variables ---
+bool isAccidentActive = false;
+bool buzzerActive = false;
 bool emergencyButtonPressed = false;
 bool mpuReady = false; // Set true only if MPU6050 initializes successfully
 
@@ -60,6 +65,7 @@ void setup() {
 
   // Turn off buzzer/LED initially
   digitalWrite(BUZZER_PIN, LOW);
+  buzzerActive = false;
   digitalWrite(LED_PIN, LOW);
 
   // Initialize WiFi
@@ -131,6 +137,13 @@ void setup() {
 }
 
 void loop() {
+  // 0. Handle Buzzer Timeout
+  if (buzzerActive && (millis() - buzzerStartTime >= BUZZER_DURATION)) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerActive = false;
+    Serial.println("[TIMER] Buzzer timed out after 4s");
+  }
+
   // 1. Read GPS data from Serial asynchronously
   while (SerialGPS.available() > 0) {
     gps.encode(SerialGPS.read());
@@ -139,8 +152,14 @@ void loop() {
   // 2. Read Button State (Active Low due to INPUT_PULLUP)
   if (digitalRead(BUTTON_PIN) == LOW) {
     emergencyButtonPressed = true;
+    isAccidentActive = true;
+    if (!buzzerActive) {
+      buzzerActive = true;
+      buzzerStartTime = millis();
+      digitalWrite(BUZZER_PIN, HIGH);
+    }
     digitalWrite(LED_PIN, HIGH);
-    digitalWrite(BUZZER_PIN, HIGH);
+    Serial.println("[LOCAL] Emergency Button Pressed!");
   }
 
   // 3. Main 1-second Loop Execution
@@ -194,6 +213,19 @@ void loop() {
       Serial.print(accelZ, 2);
       Serial.print(" | Magnitude=");
       Serial.println(magnitude, 3);
+      if (magnitude > 3.0 || tilt_angle > 60.0) {
+        isAccidentActive = true;
+        if (!buzzerActive) {
+          buzzerActive = true;
+          buzzerStartTime = millis();
+          digitalWrite(BUZZER_PIN, HIGH);
+        }
+        digitalWrite(LED_PIN, HIGH);
+        Serial.print("[LOCAL] Accident Detected! Magnitude: ");
+        Serial.print(magnitude);
+        Serial.print(" Tilt: ");
+        Serial.println(tilt_angle);
+      }
     } else {
       Serial.println("[WARN] MPU6050 not ready — skipping sensor read.");
     }
@@ -204,7 +236,7 @@ void loop() {
     bool hasGPS = gps.location.isValid();
 
     if (!hasGPS) {
-      Serial.println("[GPS] AISSMS IOIT location.");
+      Serial.println("[GPS] No fix — using AISSMS IOIT location as default.");
     }
 
     // Construct JSON Payload
@@ -237,12 +269,38 @@ void loop() {
       Serial.println(httpResponseCode);
 
       if (httpResponseCode == 200 || httpResponseCode == 201) {
-        // Successfully sent, reset emergency button if needed
-        // We might wait for an explicit OK to turn off buzzer, but for now we
-        // reset here.
-        emergencyButtonPressed = false;
-        digitalWrite(LED_PIN, LOW);
-        digitalWrite(BUZZER_PIN, LOW);
+        String response = http.getString();
+        Serial.println("Response: " + response);
+
+        // Simple JSON parsing for is_accident flag
+        // Robust check for is_accident:true (handles potential spaces)
+        bool serverAccident =
+            (response.indexOf("\"is_accident\":true") != -1) ||
+            (response.indexOf("\"is_accident\": true") != -1);
+
+        if (serverAccident) {
+          // If this is a transition from no-accident to accident, or we haven't
+          // buzzed yet for this alert
+          if (!isAccidentActive) {
+            buzzerActive = true;
+            buzzerStartTime = millis();
+            digitalWrite(BUZZER_PIN, HIGH);
+            digitalWrite(LED_PIN, HIGH);
+            Serial.println("[SERVER] New Accident Alert - Buzzing for 4s");
+          }
+          isAccidentActive = true;
+          digitalWrite(LED_PIN, HIGH);
+          Serial.println("[SERVER] Accident Alert ACTIVE");
+        } else {
+          isAccidentActive = false;
+          emergencyButtonPressed = false;
+          // Only turn off if we were active and now it's cleared
+          if (digitalRead(BUZZER_PIN) == HIGH && !buzzerActive) {
+            digitalWrite(BUZZER_PIN, LOW);
+          }
+          digitalWrite(LED_PIN, LOW);
+          Serial.println("[SERVER] No active accident");
+        }
       }
     } else {
       Serial.print("Error code: ");

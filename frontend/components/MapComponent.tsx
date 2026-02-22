@@ -29,12 +29,50 @@ const ambulanceIcon = new L.DivIcon({
     iconAnchor: [15, 15],
 });
 
-// Hospital marker
+// Hospital marker — default (small, used when ambulance is not yet heading there)
 const hospitalIcon = new L.DivIcon({
     html: '<div style="font-size:22px;line-height:1;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.6))">🏥</div>',
     className: '',
     iconSize: [28, 28],
     iconAnchor: [14, 14],
+});
+
+// Hospital marker — active (large + glowing cyan when ambulance is en-route-to-hospital)
+const hospitalActiveIcon = new L.DivIcon({
+    html: `<div style="
+        font-size:42px;
+        line-height:1;
+        filter:drop-shadow(0 0 12px rgba(34,211,238,0.95)) drop-shadow(0 2px 6px rgba(0,0,0,0.8));
+        animation:hospital-pulse 1.2s ease-in-out infinite;
+    ">🏥</div>
+    <style>
+        @keyframes hospital-pulse {
+            0%,100%{transform:scale(1);}
+            50%{transform:scale(1.18);}
+        }
+    </style>`,
+    className: '',
+    iconSize: [52, 52],
+    iconAnchor: [26, 26],
+});
+
+// Hospital marker — arrived (large green checkmark overlay)
+const hospitalArrivedIcon = new L.DivIcon({
+    html: `<div style="position:relative;display:inline-block;font-size:40px;line-height:1;filter:drop-shadow(0 0 10px rgba(34,197,94,0.9)) drop-shadow(0 2px 6px rgba(0,0,0,0.8))">
+        🏥
+        <span style="position:absolute;bottom:-4px;right:-4px;font-size:18px;">✅</span>
+    </div>`,
+    className: '',
+    iconSize: [52, 52],
+    iconAnchor: [26, 26],
+});
+
+// Police marker
+const policeIcon = new L.DivIcon({
+    html: '<div style="font-size:24px;line-height:1;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.6))">🚓</div>',
+    className: '',
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
 });
 
 // --- Types ---
@@ -43,6 +81,7 @@ interface MapProps {
     center: Location;
     devices: any[];
     ambulances: any[];
+    police: any[];
     signals: any[];
 }
 
@@ -64,7 +103,7 @@ function ChangeView({ center, zoom }: { center: Location; zoom: number }) {
 }
 
 // --- Main Component ---
-export default function MapComponent({ center, devices, ambulances, signals }: MapProps) {
+export default function MapComponent({ center, devices, ambulances, police, signals }: MapProps) {
     const [mounted, setMounted] = useState(false);
     useEffect(() => { setMounted(true); }, []);
     if (!mounted) return null;
@@ -86,11 +125,16 @@ export default function MapComponent({ center, devices, ambulances, signals }: M
 
                 {/* --- Device Markers --- */}
                 {devices.filter(d => d.id !== 'vehicle_001').map((device) => {
-                    const lat = device.latest_data?.latitude || device.latitude;
-                    const lng = device.latest_data?.longitude || device.longitude;
+                    let lat = device.latest_data?.latitude || device.latitude;
+                    let lng = device.latest_data?.longitude || device.longitude;
+
+                    // Force Raja Bahadur Mill location if GPS has no fix (overrides stale Deccan cache)
+                    if (device.latest_data && !device.latest_data.gps_fix) {
+                        lat = 18.5315;
+                        lng = 73.8670;
+                    }
+
                     if (!lat || !lng) return null;
-                    // Only show on map if GPS fix is real (hide default/fallback location)
-                    if (!device.latest_data?.gps_fix) return null;
                     const isAccident = device.latest_data?.is_accident || device.is_accident;
                     const d = device.latest_data;
                     return (
@@ -102,7 +146,7 @@ export default function MapComponent({ center, devices, ambulances, signals }: M
                                     {d && <>
                                         <p className="text-sm mt-1">⚡ Accel: <strong>{parseFloat(d.acceleration || 0).toFixed(2)}g</strong></p>
                                         <p className="text-sm">📐 Tilt: <strong>{parseFloat(d.tilt_angle || 0).toFixed(1)}°</strong></p>
-                                        <p className="text-sm">🛰 GPS: <strong>{d.gps_fix ? 'Fixed' : 'Default location'}</strong></p>
+                                        <p className="text-sm">🛰 GPS: <strong>{d.gps_fix ? 'Fixed' : 'AISSMS'}</strong></p>
                                     </>}
                                 </div>
                             </Popup>
@@ -143,12 +187,63 @@ export default function MapComponent({ center, devices, ambulances, signals }: M
                                     </div>
                                 </Popup>
                             </Marker>
-                            {/* Hospital destination marker */}
-                            {amb.hospitalLocation && (
-                                <Marker position={[amb.hospitalLocation.lat, amb.hospitalLocation.lng]} icon={hospitalIcon}>
-                                    <Popup><div className="text-slate-900"><p className="font-bold">🏥 {amb.hospitalName}</p><p className="text-sm">Destination Hospital</p></div></Popup>
-                                </Marker>
+                            {/* Hospital destination marker — animated when ambulance is heading there */}
+                            {amb.hospitalLocation && (() => {
+                                const icon = amb.status === 'arrived'
+                                    ? hospitalArrivedIcon
+                                    : amb.phase === 'to-hospital'
+                                        ? hospitalActiveIcon
+                                        : hospitalIcon;
+                                return (
+                                    <Marker position={[amb.hospitalLocation.lat, amb.hospitalLocation.lng]} icon={icon}>
+                                        <Popup>
+                                            <div className="text-slate-900 min-w-[160px]">
+                                                <p className="font-bold text-base">🏥 {amb.hospitalName}</p>
+                                                <p className="text-sm mt-1">
+                                                    {amb.status === 'arrived'
+                                                        ? '✅ Patient Delivered'
+                                                        : amb.phase === 'to-hospital'
+                                                            ? '🔴 Ambulance En Route Here'
+                                                            : 'Destination Hospital'}
+                                                </p>
+                                                {amb.id && <p className="text-xs text-blue-600 mt-1">{amb.id}</p>}
+                                            </div>
+                                        </Popup>
+                                    </Marker>
+                                );
+                            })()}
+                        </div>
+                    );
+                })}
+
+                {/* --- Police Markers + Route Polylines --- */}
+                {police.map((pol) => {
+                    if (!pol.position) return null;
+                    const pos: [number, number] = [pol.position.lat, pol.position.lng];
+                    const routePoints: [number, number][] = (pol.route || []).map((p: any) => [p.lat, p.lng]);
+
+                    return (
+                        <div key={pol.id}>
+                            {routePoints.length > 1 && (
+                                <Polyline
+                                    positions={routePoints}
+                                    pathOptions={{
+                                        color: '#1e3a8a', // Dark blue
+                                        weight: 4,
+                                        opacity: 0.8,
+                                        dashArray: '4 8',
+                                    }}
+                                />
                             )}
+                            <Marker position={pos} icon={policeIcon}>
+                                <Popup>
+                                    <div className="text-slate-900 min-w-[180px]">
+                                        <p className="font-bold text-blue-900">🚓 {pol.id}</p>
+                                        <p className="text-sm">{pol.name}</p>
+                                        <p className="text-sm mt-1">Status: <strong>{pol.status?.replace(/-/g, ' ')}</strong></p>
+                                    </div>
+                                </Popup>
+                            </Marker>
                         </div>
                     );
                 })}

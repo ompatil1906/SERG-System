@@ -12,8 +12,11 @@ export default function Dashboard() {
     const [liveDevices, setLiveDevices] = useState<any[]>([]); // Polled from backend (no Firestore quota)
     const [alerts, setAlerts] = useState<any[]>([]);
     const [ambulances, setAmbulances] = useState<any[]>([]);
+    const [liveAmbulances, setLiveAmbulances] = useState<any[]>([]);
+    const [livePolice, setLivePolice] = useState<any[]>([]);
     const [signals, setSignals] = useState<any[]>([]);
-    const [center] = useState({ lat: 18.5204, lng: 73.8567 });
+    const [liveSignals, setLiveSignals] = useState<any[]>([]);
+    const [center] = useState({ lat: 18.5315, lng: 73.8670 });
 
     // Poll backend /api/live-data every 2s (bypasses Firestore quota limits)
     useEffect(() => {
@@ -21,7 +24,10 @@ export default function Dashboard() {
             try {
                 const res = await fetch('http://10.125.252.77:5000/api/live-data');
                 const json = await res.json();
-                if (json.devices?.length > 0) setLiveDevices(json.devices);
+                if (json.devices) setLiveDevices(json.devices);
+                if (json.ambulances) setLiveAmbulances(json.ambulances);
+                if (json.police) setLivePolice(json.police);
+                if (json.signals) setLiveSignals(json.signals);
             } catch (_) { /* backend not reachable, keep showing last known state */ }
         };
         fetchLive();
@@ -72,6 +78,51 @@ export default function Dashboard() {
         await batch.commit();
     };
 
+    // --- Merging logic (Bypasses Firestore quota issues) ---
+    const mergedDevices = [...devices];
+    liveDevices.forEach(ld => {
+        const index = mergedDevices.findIndex(d => d.id === ld.id);
+        if (index > -1) {
+            mergedDevices[index] = { ...mergedDevices[index], ...ld };
+        } else {
+            mergedDevices.push(ld);
+        }
+    });
+
+    const mergedAmbulances = [...ambulances];
+    liveAmbulances.forEach(la => {
+        const index = mergedAmbulances.findIndex(a => a.id === la.id);
+        if (index > -1) {
+            mergedAmbulances[index] = { ...mergedAmbulances[index], ...la };
+        } else {
+            mergedAmbulances.push(la);
+        }
+    });
+
+    const mergedSignals = [...signals];
+    liveSignals.forEach(ls => {
+        const index = mergedSignals.findIndex(s => s.id === ls.id);
+        if (index > -1) {
+            mergedSignals[index] = { ...mergedSignals[index], ...ls };
+        } else {
+            mergedSignals.push(ls);
+        }
+    });
+
+    const activeLiveAlerts = liveDevices
+        .filter(d => d.latest_data?.is_accident)
+        .map(d => ({
+            id: `live-${d.id}`,
+            device_id: d.id,
+            timestamp: d.latest_data.server_timestamp || Date.now(),
+            location: { lat: d.latest_data.latitude || 18.5315, lng: d.latest_data.longitude || 73.8670 },
+            severity: d.latest_data.severity || 'CRITICAL',
+            triggers: ['Live Telemetry (ESP32)']
+        }));
+
+    // Simple deduplication - prioritize live alerts
+    const mergedAlerts = [...activeLiveAlerts, ...alerts.filter(a => !activeLiveAlerts.find(la => la.device_id === a.device_id))];
+
     return (
         <div className="flex h-screen bg-slate-950 p-4 gap-4 overflow-hidden">
             {/* Side Panel */}
@@ -82,16 +133,16 @@ export default function Dashboard() {
                         <h2 className="text-xl font-bold flex items-center gap-2 text-red-500">
                             <AlertTriangle className="w-5 h-5" /> Active Alerts
                         </h2>
-                        {alerts.length > 0 && (
+                        {mergedAlerts.length > 0 && (
                             <button onClick={clearAlerts} className="text-xs px-3 py-1.5 bg-slate-700 hover:bg-red-900/50 text-slate-300 hover:text-red-300 border border-slate-600 hover:border-red-700 rounded-lg transition-colors">
                                 Clear All
                             </button>
                         )}
                     </div>
                     <div className="space-y-3">
-                        {alerts.length === 0 ? (
+                        {mergedAlerts.length === 0 ? (
                             <p className="text-slate-500 italic text-sm">No recent alerts</p>
-                        ) : alerts.map(alert => (
+                        ) : mergedAlerts.map(alert => (
                             <div key={alert.id} className="p-3 bg-red-950/30 border border-red-900/50 rounded-lg">
                                 <div className="flex justify-between items-start mb-2">
                                     <span className="font-bold text-red-400">{alert.device_id}</span>
@@ -169,12 +220,47 @@ export default function Dashboard() {
                     })}
                 </div>
 
+                {/* Hospital Destination Banner — shown when ambulance is going to / arrived at hospital */}
+                {mergedAmbulances.some(a => a.phase === 'to-hospital' || a.status === 'arrived') && (() => {
+                    const amb = mergedAmbulances.find(a => a.phase === 'to-hospital' || a.status === 'arrived');
+                    const isArrived = amb?.status === 'arrived';
+                    return (
+                        <div className={`rounded-xl p-4 border-2 relative overflow-hidden ${isArrived
+                                ? 'bg-emerald-950/60 border-emerald-500/70'
+                                : 'bg-cyan-950/60 border-cyan-500/70'
+                            }`}>
+                            {/* Pulse ring */}
+                            {!isArrived && (
+                                <span className="absolute top-3 right-3 flex h-3 w-3">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+                                    <span className="relative inline-flex rounded-full h-3 w-3 bg-cyan-500"></span>
+                                </span>
+                            )}
+                            <div className="flex items-center gap-3">
+                                <div className="text-5xl leading-none drop-shadow-lg">🏥</div>
+                                <div>
+                                    <div className={`text-xs font-bold uppercase tracking-widest mb-0.5 ${isArrived ? 'text-emerald-400' : 'text-cyan-400'
+                                        }`}>
+                                        {isArrived ? '✅ Patient Delivered' : '🔴 Ambulance En Route'}
+                                    </div>
+                                    <div className="text-white font-black text-lg leading-tight">
+                                        {amb?.hospitalName || 'Hospital'}
+                                    </div>
+                                    <div className="text-xs text-slate-300 mt-0.5">
+                                        {isArrived ? 'Mission complete — patient at hospital' : `${amb?.id} heading to hospital`}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })()}
+
                 {/* Ambulance Status */}
-                {ambulances.length > 0 && (
+                {mergedAmbulances.length > 0 && (
                     <div className="bg-slate-900 border border-blue-900/50 rounded-xl p-4 overflow-auto">
                         <h2 className="text-lg font-bold mb-3 text-blue-400">🚑 Ambulance Fleet</h2>
                         <div className="space-y-2">
-                            {ambulances.map(amb => (
+                            {mergedAmbulances.map(amb => (
                                 <div key={amb.id} className="flex justify-between items-center p-2 rounded bg-blue-950/30 border border-blue-900/30">
                                     <div>
                                         <div className="font-mono text-sm text-blue-200">{amb.id}</div>
@@ -198,7 +284,7 @@ export default function Dashboard() {
                         <Activity className="w-5 h-5" /> Device Fleet
                     </h2>
                     <div className="space-y-2">
-                        {devices.map(device => {
+                        {mergedDevices.map(device => {
                             const isAccident = device.latest_data?.is_accident;
                             return (
                                 <div key={device.id} className="flex justify-between items-center p-2 rounded hover:bg-slate-800/50 transition-colors">
@@ -222,15 +308,15 @@ export default function Dashboard() {
                     </div>
                     <div className="flex gap-6 text-center">
                         <div>
-                            <div className="text-3xl font-light text-slate-200">{devices.length}</div>
+                            <div className="text-3xl font-light text-slate-200">{mergedDevices.length}</div>
                             <div className="text-xs text-slate-500 uppercase font-bold tracking-wider">Active Devices</div>
                         </div>
                         <div>
-                            <div className="text-3xl font-light text-blue-400">{ambulances.filter(a => a.status !== 'arrived').length}</div>
+                            <div className="text-3xl font-light text-blue-400">{mergedAmbulances.filter(a => a.status !== 'arrived').length}</div>
                             <div className="text-xs text-blue-500/70 uppercase font-bold tracking-wider">Ambulances Active</div>
                         </div>
                         <div>
-                            <div className="text-3xl font-light text-red-400">{alerts.length}</div>
+                            <div className="text-3xl font-light text-red-400">{mergedAlerts.length}</div>
                             <div className="text-xs text-red-500/70 uppercase font-bold tracking-wider">Total Alerts</div>
                         </div>
                         <div className="flex items-center">
@@ -245,7 +331,7 @@ export default function Dashboard() {
                 </header>
 
                 <div className="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-2 relative overflow-hidden shadow-2xl">
-                    <Map center={center} devices={devices} ambulances={ambulances} signals={signals} />
+                    <Map center={center} devices={mergedDevices} ambulances={mergedAmbulances} police={livePolice} signals={mergedSignals} />
                 </div>
             </div>
         </div>

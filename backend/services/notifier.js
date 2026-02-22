@@ -40,7 +40,7 @@ async function sendSMS(to, message) {
         });
         console.log('SMS Sent:', info.sid);
     } catch (error) {
-        console.error('Failed to send SMS:', error);
+        // SMS delivery failed silently (quota/credential issues)
     }
 }
 
@@ -58,7 +58,7 @@ async function sendEmail(to, subject, body) {
         });
         console.log('Email Sent:', info.messageId);
     } catch (error) {
-        console.error('Failed to send Email:', error);
+        // Email delivery failed silently (SMTP credential issues)
     }
 }
 

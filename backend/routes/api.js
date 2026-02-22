@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const { db } = require('../services/firebase');
 const { analyzeTelemetry } = require('../services/accidentDetection');
 const { triggerEmergencyNotifications } = require('../services/notifier');
-const { dispatchAmbulance } = require('../services/ambulanceDispatcher');
+const { dispatchAmbulance, getEmergencyState } = require('../services/ambulanceDispatcher');
 
 // Mock user contacts for demonstration
 const EMERGENCY_CONTACTS = [
@@ -16,10 +16,22 @@ const EMERGENCY_CONTACTS = [
 // Gets updated every time an ESP32 payload arrives
 const deviceCache = {};
 
+// --- Accident Latch: keeps is_accident=true for 5 min after first detection ---
+// Prevents subsequent calm payloads from clearing the alert during simulation
+const accidentLatch = {}; // { device_id: { until: timestamp, dispatched: bool } }
+const LATCH_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+
 // --- Public live-data endpoint — frontend polls this every 2s ---
 router.get('/live-data', (req, res) => {
     const devices = Object.values(deviceCache);
-    res.json({ devices, updatedAt: new Date().toISOString() });
+    const emergencyState = getEmergencyState();
+    res.json({
+        devices,
+        ambulances: emergencyState.ambulances,
+        police: emergencyState.police,
+        signals: emergencyState.signals,
+        updatedAt: new Date().toISOString()
+    });
 });
 
 // --- Authentication Route ---
@@ -56,8 +68,25 @@ router.post('/device-data', async (req, res) => {
             return res.status(400).json({ error: 'Missing critical fields' });
         }
 
-        // 1. Run Accident Detection Logic (fast, sync)
+        // --- Accident Latch Logic ---
+        // 1. Run current sensor analysis
         const analysis = analyzeTelemetry(data);
+
+        const now = Date.now();
+        const latch = accidentLatch[data.device_id];
+        const isLatched = !!(latch && latch.until > now);
+
+        // Lock in accident if newly detected
+        if (analysis.isAccident && !isLatched) {
+            accidentLatch[data.device_id] = { until: now + LATCH_DURATION_MS, dispatched: false };
+            console.log(`[LATCH] Accident latched for ${data.device_id} until ${new Date(now + LATCH_DURATION_MS).toISOString()}`);
+        }
+
+        // Determine effective accident state (honour latch even if sensor is now calm)
+        const effectiveIsAccident = analysis.isAccident || isLatched;
+        const effectiveSeverity = effectiveIsAccident
+            ? (analysis.severity !== 'None' ? analysis.severity : (latch?.severity || 'HIGH'))
+            : 'None';
 
         // 2. Update in-memory cache immediately (works even if Firestore quota is exhausted)
         deviceCache[data.device_id] = {
@@ -67,15 +96,15 @@ router.post('/device-data', async (req, res) => {
             latest_data: {
                 ...data,
                 server_timestamp: new Date().toISOString(),
-                is_accident: analysis.isAccident,
-                severity: analysis.severity
+                is_accident: effectiveIsAccident,
+                severity: effectiveSeverity
             }
         };
 
-        // 3. ACK the ESP32 IMMEDIATELY — don't wait for Firebase
-        res.status(201).json({ success: true, is_accident: analysis.isAccident });
+        // ACK the ESP32 IMMEDIATELY — don't wait for Firebase
+        res.status(201).json({ success: true, is_accident: effectiveIsAccident });
 
-        // 3. All Firebase writes + notifications happen in background AFTER response
+        // All Firebase writes + notifications happen in background AFTER response
         setImmediate(async () => {
             try {
                 const deviceRef = db.collection('devices').doc(data.device_id);
@@ -85,22 +114,26 @@ router.post('/device-data', async (req, res) => {
                 batch.set(historyRef, {
                     ...data,
                     server_timestamp: new Date().toISOString(),
-                    is_accident: analysis.isAccident,
-                    severity: analysis.severity
+                    is_accident: effectiveIsAccident,
+                    severity: effectiveSeverity
                 });
 
                 batch.set(deviceRef, {
                     latest_data: {
                         ...data,
                         server_timestamp: new Date().toISOString(),
-                        is_accident: analysis.isAccident,
-                        severity: analysis.severity
+                        is_accident: effectiveIsAccident,
+                        severity: effectiveSeverity
                     },
                     status: 'Online',
                     last_seen: new Date().toISOString()
                 }, { merge: true });
 
-                if (analysis.isAccident) {
+                // Only dispatch once per latch window
+                if (analysis.isAccident && accidentLatch[data.device_id] && !accidentLatch[data.device_id].dispatched) {
+                    accidentLatch[data.device_id].dispatched = true;
+                    accidentLatch[data.device_id].severity = analysis.severity;
+
                     const alertRef = db.collection('alerts').doc();
                     batch.set(alertRef, {
                         device_id: data.device_id,
@@ -110,19 +143,21 @@ router.post('/device-data', async (req, res) => {
                         status: 'Unresolved',
                         timestamp: analysis.timestamp
                     });
-                }
 
-                await batch.commit();
-                console.log(`[DB] Data saved for ${data.device_id} | accident=${analysis.isAccident}`);
-
-                if (analysis.isAccident) {
                     triggerEmergencyNotifications(data, analysis, EMERGENCY_CONTACTS)
                         .catch(err => console.error('Notification Error:', err));
                     dispatchAmbulance(data)
                         .catch(err => console.error('Ambulance Dispatch Error:', err));
                 }
+
+                try {
+                    await batch.commit();
+                    console.log(`[DB] Data saved for ${data.device_id} | accident=${analysis.isAccident}`);
+                } catch (dbErr) {
+                    console.error('[DB] Firebase write error (ignoring for simulation):', dbErr.message);
+                }
             } catch (bgErr) {
-                console.error('[BG] Firebase write error:', bgErr.message);
+                console.error('[BG] Background processing error:', bgErr.message);
             }
         });
 
